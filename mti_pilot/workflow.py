@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from . import ledger as L
 from .config import MICRO_LIVE, SHADOW, PilotConfig
 from .guard import BookView, GuardResult, OpenPosition
+from .measurement import benchmark_of, hypothetical_outcome, trade_outcome, trade_result
 
 STOCKHOLM = ZoneInfo("Europe/Stockholm")
 ACTIVATION_PHRASE = "JAG AKTIVERAR MICRO_LIVE"
@@ -55,17 +56,6 @@ def _positive(name: str, value, allow_zero: bool = False) -> float:
     if value < 0 or (value == 0 and not allow_zero):
         raise WorkflowError(f"{name} must be {'non-negative' if allow_zero else 'positive'}, got {value}")
     return float(value)
-
-
-def trade_result(execution: dict, close: dict) -> dict:
-    """Realized result of a closed trade, after courtage and estimated slippage."""
-    quantity = execution["quantity"]
-    gross = (close["price"] - execution["price"]) * quantity
-    costs = execution["courtage"] + execution["slippage"] + close["courtage"] + close["slippage"]
-    net = gross - costs
-    invested = execution["price"] * quantity
-    return {"gross_pnl": round(gross, 2), "costs": round(costs, 2), "net_pnl": round(net, 2),
-            "net_return": net / invested if invested else None}
 
 
 class Pilot:
@@ -342,19 +332,20 @@ class Pilot:
 
     # --- Outcome --------------------------------------------------------------------------
 
-    def evaluate(self, run_id: str, *, get_closes=None, fetch_returns=None,
-                 holding_days: int = 5) -> dict:
-        """Score a run against its Swedish benchmark.
+    def evaluate(self, run_id: str, *, get_closes=None) -> dict:
+        """Score one run against its benchmark and record the result as EVALUATED.
 
-        A closed trade is scored on what Mats actually got, net of costs, against
-        the benchmark between the fill days' closes. A run that was never
-        executed is scored as a shadow observation with upstream's own
-        settlement: raw and alpha return over ``holding_days`` trading days.
+        A closed trade is scored on what Mats actually got, net of costs. A run
+        that was never executed is scored hypothetically, exactly as the report
+        does (``measurement.hypothetical_outcome``). ``mti-pilot evaluate``
+        without a run reports every run instead, and records nothing.
         """
+        if get_closes is None:
+            from tradingagents.dataflows.vendors.yahoo.market import get_closes
         events = self.ledger.events()
         status = self.status(run_id, events)
         proposal = self.proposal(run_id, events)
-        benchmark = proposal["benchmark"]
+        benchmark = benchmark_of(proposal)
         if status == L.EVALUATED:
             last_eval = self._last(events, run_id, {L.EVALUATED})
             corrected_after = any(e["type"] == L.CORRECTION and e["run_id"] == run_id
@@ -364,42 +355,17 @@ class Pilot:
             status = L.CLOSED if self._last(events, run_id, {L.CLOSED}) else "SHADOW"
 
         if status == L.CLOSED:
-            if get_closes is None:
-                from tradingagents.dataflows.vendors.yahoo.market import get_closes
             payloads = self._corrected(events)
             execution = payloads[self._last(events, run_id, {L.MANUALLY_EXECUTED})["event_id"]]
             close = payloads[self._last(events, run_id, {L.CLOSED})["event_id"]]
-            entry_day = datetime.fromisoformat(execution["executed_at"]).astimezone(STOCKHOLM).date()
-            exit_day = datetime.fromisoformat(close["executed_at"]).astimezone(STOCKHOLM).date()
-            series = get_closes(benchmark, (entry_day - timedelta(days=7)).isoformat(),
-                                (exit_day + timedelta(days=1)).isoformat())
-            series = series[series > 0]
-            days = [d.date() if hasattr(d, "date") else d for d in series.index]
-            if not days or days[0] > entry_day or days[-1] < exit_day:
-                raise WorkflowError(f"{benchmark} has no close for the exit day yet; evaluate later")
-            at = {d: float(v) for d, v in zip(days, series.values, strict=True)}
-            start = at[max(d for d in days if d <= entry_day)]
-            end = at[max(d for d in days if d <= exit_day)]
-            result = trade_result(execution, close)
-            bench_return = (end - start) / start
-            payload = {"kind": "trade", "benchmark": benchmark, **result,
-                       "benchmark_return": bench_return,
-                       "alpha_net": result["net_return"] - bench_return,
-                       "benchmark_window": [entry_day.isoformat(), exit_day.isoformat()],
-                       "method": "benchmark close on the entry fill day to close on the exit fill day"}
+            payload = trade_outcome(execution, close, benchmark, get_closes)
         elif status in ("TRADEABLE", "BLOCKED", L.USER_REJECTED, "SHADOW"):
-            if fetch_returns is None:
-                from tradingagents.memory.settlement import fetch_returns
-            raw, alpha, days_held, resolved = fetch_returns(
-                proposal["ticker"], proposal["analysis_date"], holding_days, benchmark=benchmark)
-            if raw is None:
-                raise WorkflowError("the holding window has not traded yet; evaluate later")
-            payload = {"kind": "shadow", "benchmark": benchmark, "raw_return": raw,
-                       "alpha_return": alpha, "holding_days": days_held,
-                       "resolution_date": resolved, "guard_status": self.risk_check(run_id, events)["status"],
+            payload = {"kind": "shadow", **hypothetical_outcome(proposal, get_closes),
+                       "guard_status": self.risk_check(run_id, events)["status"],
                        "final_rating": proposal["decision"]["final_rating"],
-                       "is_historical": proposal["is_historical"],
-                       "method": "upstream settlement.fetch_returns; no costs; not a trade"}
+                       "is_historical": proposal["is_historical"]}
         else:
             raise WorkflowError(f"run {run_id} is {status}; nothing to evaluate yet")
+        if payload["state"] != "ok":
+            raise WorkflowError(f"{payload['reason']}; evaluate later")
         return self.ledger.append(L.EVALUATED, payload, run_id=run_id)

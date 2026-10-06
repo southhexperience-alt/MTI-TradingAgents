@@ -7,14 +7,15 @@ Apache License, Version 2.0 (see LICENSE). It is based on upstream
 release v0.6.0, commit 1394a3f72aa4393e1a98f51b382434c4b4c2d972.
 
 Upstream files modified in this fork:
-- tradingagents/default_config.py  (added ".ST" -> "^OMXSPI" to benchmark_map)
+- tradingagents/default_config.py  (added ".ST" -> "^OMXSBGI", a gross
+                                    total-return index, to benchmark_map)
 - pyproject.toml                   (packages the mti_pilot module and its
                                     mti-pilot console script)
 
 Added in this fork:
 - mti_pilot/            Swedish guarded pilot layer (risk guard, ledger,
                         manual-execution workflow, CLI)
-- tests/test_mti_pilot.py
+- tests/test_mti_pilot.py, tests/mti_guard_cases.py, tests/data/mti_guard_golden.json
 - MTI_PILOT.md
 - NOTICE
 

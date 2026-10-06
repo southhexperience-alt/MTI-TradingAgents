@@ -146,12 +146,28 @@ def close_trade(run_id: str, price: float = typer.Option(...), quantity: float =
 
 
 @app.command()
-def evaluate(run_id: str):
-    """Score a run against its benchmark (^OMXSPI for .ST)."""
-    try:
-        _show(_pilot().evaluate(run_id))
-    except (WorkflowError, LedgerError) as exc:
-        _fail(exc)
+def evaluate(
+    run_id: str = typer.Argument(None, help="Record one run's outcome as EVALUATED instead"),
+    include_historical: bool = typer.Option(
+        False, "--include-historical",
+        help="Also show runs dated before they were made, in a separate section"),
+    as_json: bool = typer.Option(False, "--json", help="Machine-readable report"),
+):
+    """Outcomes for every proposal: TRADEABLE, BLOCKED (per reason) and executed, apart."""
+    from .measurement import build_report, render_report
+
+    pilot = _pilot()
+    if run_id:
+        try:
+            _show(pilot.evaluate(run_id))
+        except (WorkflowError, LedgerError) as exc:
+            _fail(exc)
+        return
+    report = build_report(pilot, include_historical=include_historical)
+    if as_json:
+        _show(report)
+    else:
+        typer.echo(render_report(report))
 
 
 @app.command()

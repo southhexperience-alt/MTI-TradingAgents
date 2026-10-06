@@ -24,6 +24,7 @@ from . import MTI_VERSION, UPSTREAM_COMMIT, UPSTREAM_REPO, UPSTREAM_VERSION
 from .config import tradingagents_config
 from .guard import GuardResult, ReferencePrice, check
 from .ledger import write_once
+from .measurement import benchmark_basis
 from .proposal import extract_decision
 from .workflow import Pilot, WorkflowError
 
@@ -109,6 +110,7 @@ def run_analysis(
     except Exception as exc:  # reports are for reading; the ledger is the record
         report_dir = f"not written: {type(exc).__name__}: {exc}"
 
+    benchmark = resolve_benchmark(ticker, ta_config)
     data_dir = Path(pilot.config.data_dir)
     state = {k: final_state.get(k) for k in _STATE_KEYS}
     state["investment_debate_history"] = (final_state.get("investment_debate_state") or {}).get("history")
@@ -128,7 +130,9 @@ def run_analysis(
                      "upstream_version": UPSTREAM_VERSION, "upstream_commit": UPSTREAM_COMMIT,
                      "mti": MTI_VERSION, "code_commit": code_commit()},
         "run_settings": graph.run_settings(),
-        "benchmark": resolve_benchmark(ticker, ta_config),
+        # Recorded per run, so a later change of benchmark stays traceable.
+        "benchmark": benchmark,
+        "benchmark_basis": benchmark_basis(benchmark),
         "holding_period_days": ta_config.get("holding_period_days"),
         "market_data": {"reference_price": reference.price, "reference_date": reference.date,
                         "source": reference.source,

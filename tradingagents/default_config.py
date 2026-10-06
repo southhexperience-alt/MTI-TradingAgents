@@ -194,7 +194,7 @@ def build_default_config() -> dict:
             ".PA":  "^FCHI",       # Paris (CAC 40)
             ".AS":  "^AEX",        # Amsterdam (AEX)
             ".SW":  "^SSMI",       # Switzerland (SMI)
-            ".ST":  "^OMXSPI",     # Nasdaq Stockholm (OMX Stockholm All-Share, price index)
+            ".ST":  "^OMXSBGI",    # Nasdaq Stockholm (OMX Stockholm Benchmark, gross/total return)
             ".MI":  "FTSEMIB.MI",  # Milan (FTSE MIB)
             ".TO":  "^GSPTSE",     # Toronto (TSX Composite)
             ".AX":  "^AXJO",       # Australia (ASX 200)

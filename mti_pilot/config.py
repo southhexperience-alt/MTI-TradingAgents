@@ -151,7 +151,7 @@ def tradingagents_config(pilot: PilotConfig, base: dict | None = None) -> dict:
     """The upstream config a pilot run uses: upstream defaults, plus the pilot's own files.
 
     The pilot keeps its own memory log and results, so its decisions and their
-    settlement against ^OMXSPI never mix with other TradingAgents use. Swedish
+    settlement against the benchmark never mix with other TradingAgents use. Swedish
     macro queries are added to upstream's, not substituted for them.
     """
     from tradingagents.default_config import build_default_config

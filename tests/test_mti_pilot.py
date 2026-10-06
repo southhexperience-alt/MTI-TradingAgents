@@ -1,17 +1,17 @@
-"""MTI Swedish guarded pilot: benchmark, risk guard, modes, ledger and manual workflow."""
+"""MTI Swedish guarded pilot: benchmark, risk guard, modes, ledger, workflow and measurement."""
 
 from __future__ import annotations
 
 import ast
 import copy
 import json
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from mti_pilot import ledger as L
+from mti_pilot import ledger as L, measurement as M
 from mti_pilot.config import (
     MICRO_LIVE,
     SHADOW,
@@ -73,16 +73,30 @@ def _live_pilot(tmp_path, **amounts) -> Pilot:
 _EMPTY_BOOK = PortfolioContext()
 
 
+_UNSET = object()
+
+
 def _record(pilot: Pilot, decision=None, portfolio=_EMPTY_BOOK, ticker=TICKER,
-            reference=REF, historical=False) -> str:
-    """Record a proposal and its guard result as the runner does, without a model."""
+            reference=REF, historical=False, benchmark=_UNSET) -> str:
+    """Record a proposal and its guard result as the runner does, without a model.
+
+    ``benchmark=None`` writes a record without the field, as before it existed.
+    """
     decision = decision or _decision()
     run_id = f"{TODAY}_{ticker}_{len(pilot.run_ids()):08d}"
-    pilot.record_proposal({
+    record = {
         "run_id": run_id, "created_on": pilot._today(), "ticker": ticker,
         "analysis_date": TODAY, "is_historical": historical, "mode": pilot.run_mode(),
-        "benchmark": resolve_benchmark(ticker, DEFAULT_CONFIG), "decision": decision.to_dict(),
-    })
+        "benchmark": resolve_benchmark(ticker, DEFAULT_CONFIG), "holding_period_days": 5,
+        "market_data": {"reference_price": reference.price, "reference_date": reference.date,
+                        "source": reference.source},
+        "decision": decision.to_dict(),
+    }
+    if benchmark is not _UNSET:
+        record.pop("benchmark")
+        if benchmark is not None:
+            record["benchmark"] = benchmark
+    pilot.record_proposal(record)
     result = check(ticker=ticker, analysis_date=TODAY, decision=decision, reference=reference,
                    config=pilot.config, mode=pilot.run_mode(), book=pilot.book(),
                    portfolio=portfolio)
@@ -96,9 +110,10 @@ def _now() -> str:
 
 # 1. Swedish benchmark -------------------------------------------------------------------
 
-def test_a_stockholm_ticker_is_measured_against_omxspi():
+def test_a_stockholm_ticker_is_measured_against_the_gross_omxsbgi():
     for ticker in ("VOLV-B.ST", "ERIC-B.ST", "INVE-B.ST", "ATCO-A.ST", "SEB-A.ST", "volv-b.st"):
-        assert resolve_benchmark(ticker, DEFAULT_CONFIG) == "^OMXSPI"
+        assert resolve_benchmark(ticker, DEFAULT_CONFIG) == "^OMXSBGI"
+    assert M.benchmark_basis("^OMXSBGI") == "total_return"
     # The new suffix does not capture its neighbours.
     assert resolve_benchmark("7203.T", DEFAULT_CONFIG) == "^N225"
     assert resolve_benchmark("NOVN.SW", DEFAULT_CONFIG) == "^SSMI"
@@ -107,7 +122,7 @@ def test_a_stockholm_ticker_is_measured_against_omxspi():
 
 def test_the_pilot_keeps_upstream_config_and_its_own_files(tmp_path):
     cfg = tradingagents_config(_config(tmp_path), base=copy.deepcopy(DEFAULT_CONFIG))
-    assert cfg["benchmark_map"][".ST"] == "^OMXSPI"
+    assert cfg["benchmark_map"][".ST"] == "^OMXSBGI"
     assert cfg["memory_log_path"].startswith(str(tmp_path))
     assert set(DEFAULT_CONFIG["global_news_queries"]) < set(cfg["global_news_queries"])
 
@@ -149,7 +164,9 @@ def test_a_swedish_ticker_goes_through_the_analysis_and_is_recorded(tmp_path, mo
         graph_factory=scripted_graph(structured=True),
         reference_fn=lambda t, d, c: ReferencePrice(100.5, d, "test prices"))
 
-    assert record["ticker"] == TICKER and record["benchmark"] == "^OMXSPI"
+    assert record["ticker"] == TICKER and record["benchmark"] == "^OMXSBGI"
+    assert record["benchmark_basis"] == "total_return"
+    assert pilot.proposal(run_id)["benchmark"] == "^OMXSBGI"     # on the ledger record itself
     assert record["decision"]["final_rating"] == "Overweight"
     assert record["decision"]["entry_price"] == 100.0 and record["decision"]["stop_loss"] == 95.0
     assert record["versions"]["upstream_commit"].startswith("1394a3f")
@@ -157,7 +174,7 @@ def test_a_swedish_ticker_goes_through_the_analysis_and_is_recorded(tmp_path, mo
     assert result.status == TRADEABLE, result.blockers
     assert [e["type"] for e in pilot.ledger.events()] == [L.PROPOSED, L.RISK_CHECKED]
     assert Path(record["state_file"]).is_file()
-    # Upstream's own memory log holds the decision, to settle it against ^OMXSPI.
+    # Upstream's own memory log holds the decision, to settle it against ^OMXSBGI.
     from tradingagents.memory import TradingMemoryLog
     entries = TradingMemoryLog({"memory_log_path": _ta_config(pilot)["memory_log_path"]}).load_entries()
     assert [(e["ticker"], e["rating"]) for e in entries] == [(TICKER, "Overweight")]
@@ -497,7 +514,36 @@ def test_a_correction_is_appended_and_the_original_kept(tmp_path):
 
 # 14. Results are measured against the Swedish benchmark ------------------------------------
 
-def test_a_closed_trade_is_evaluated_net_of_costs_against_omxspi(tmp_path):
+REF_DAY = "2026-09-01"
+PAST = ReferencePrice(100.0, REF_DAY, "test prices")
+# Business days from 2026-08-25: the reference day 2026-09-01 is index 5, five
+# sessions later (2026-09-08) is index 10.
+_STOCK = [98, 99, 99, 100, 100, 100, 104, 96, 106, 108, 110, 111, 112, 113, 114]
+_SLUMP = [100, 100, 100, 100, 100, 100, 97, 93, 94, 95, 96, 96, 96, 96, 96]
+_INDEX = [990, 990, 990, 990, 990, 1000, 1005, 1000, 1010, 1015, 1020, 1021, 1022, 1023, 1024]
+
+
+def _series(values, start="2026-08-25"):
+    index = pd.bdate_range(start=start, periods=len(values), tz="Europe/Stockholm")
+    return pd.Series([float(v) for v in values], index=index)
+
+
+def _market(asked=None, **series):
+    """A get_closes over fixed series, end-exclusive like upstream's."""
+    def get_closes(symbol, start, end):
+        if asked is not None:
+            asked.append(symbol)
+        s = series[symbol]
+        keep = [date.fromisoformat(start) <= d.date() < date.fromisoformat(end) for d in s.index]
+        return s[keep]
+    return get_closes
+
+
+MARKET = {"VOLV-B.ST": _series(_STOCK), "ERIC-B.ST": _series(_SLUMP),
+          "^OMXSBGI": _series(_INDEX), "^OMXSPI": _series(_INDEX)}
+
+
+def test_a_closed_trade_is_evaluated_net_of_costs_against_omxsbgi(tmp_path):
     pilot = _live_pilot(tmp_path)
     run_id = _record(pilot)
     pilot.approve(run_id)
@@ -513,7 +559,8 @@ def test_a_closed_trade_is_evaluated_net_of_costs_against_omxspi(tmp_path):
         return pd.Series([1000.0, 1010.0], index=[day - pd.Timedelta(days=1), day])
 
     payload = pilot.evaluate(run_id, get_closes=closes)["payload"]
-    assert asked == ["^OMXSPI"] and payload["benchmark"] == "^OMXSPI"
+    assert asked == ["^OMXSBGI"] and payload["benchmark"] == "^OMXSBGI"
+    assert payload["hypothetical"] is False
     assert payload["net_pnl"] == 196.0                       # 200 gross - 4 costs
     assert payload["benchmark_return"] == pytest.approx(0.0)  # same-day fills
     assert payload["alpha_net"] == pytest.approx(196.0 / 2000.0)
@@ -522,30 +569,201 @@ def test_a_closed_trade_is_evaluated_net_of_costs_against_omxspi(tmp_path):
         pilot.evaluate(run_id, get_closes=closes)
 
 
-def test_a_shadow_proposal_is_evaluated_with_upstream_settlement_against_omxspi(tmp_path):
+def test_a_shadow_proposal_is_evaluated_hypothetically_against_omxsbgi(tmp_path):
     pilot = Pilot(_config(tmp_path))
-    run_id = _record(pilot)
-    seen = {}
-
-    def fetch_returns(ticker, date, days, benchmark):
-        seen.update(ticker=ticker, benchmark=benchmark)
-        return 0.02, 0.005, days, "2026-10-13"
-
-    payload = pilot.evaluate(run_id, fetch_returns=fetch_returns)["payload"]
-    assert seen == {"ticker": TICKER, "benchmark": "^OMXSPI"}
-    assert payload["kind"] == "shadow" and payload["alpha_return"] == 0.005
+    run_id = _record(pilot, reference=PAST)
+    asked = []
+    payload = pilot.evaluate(run_id, get_closes=_market(asked, **MARKET))["payload"]
+    assert asked == [TICKER, "^OMXSBGI"]
+    assert payload["kind"] == "shadow" and payload["hypothetical"] is True
+    assert (payload["entry_date"], payload["exit_date"]) == ("2026-09-01", "2026-09-08")
+    assert payload["raw_return"] == pytest.approx(0.10)
+    assert payload["alpha"] == pytest.approx(0.08)
+    late = _record(pilot, reference=ReferencePrice(110.0, "2026-09-10", "test prices"))
     with pytest.raises(WorkflowError, match="not traded yet"):
-        pilot.evaluate(_record(pilot), fetch_returns=lambda *a, **k: (None, None, None, None))
+        pilot.evaluate(late, get_closes=_market(**MARKET))
+
+
+def test_a_record_without_a_benchmark_is_measured_against_omxspi(tmp_path):
+    pilot = Pilot(_config(tmp_path))
+    old = _record(pilot, reference=PAST, benchmark=None)
+    assert "benchmark" not in pilot.proposal(old)
+    asked = []
+    outcome = M.hypothetical_outcome(pilot.proposal(old), _market(asked, **MARKET))
+    assert asked == [TICKER, "^OMXSPI"] and outcome["benchmark"] == "^OMXSPI"
+    assert outcome["benchmark_basis"] == "price"
+    new = _record(pilot, reference=PAST)
+    assert M.hypothetical_outcome(pilot.proposal(new), _market(**MARKET))["benchmark"] == "^OMXSBGI"
+
+
+def test_the_outcome_comes_from_one_adjusted_series_not_the_recorded_price(tmp_path):
+    """A dividend after the analysis lowers the adjusted close of the reference day; the
+    return must still run from that adjusted close, or the dividend drops out of it."""
+    pilot = Pilot(_config(tmp_path))
+    run_id = _record(pilot, reference=ReferencePrice(104.0, REF_DAY, "unadjusted at the time"))
+    outcome = M.hypothetical_outcome(pilot.proposal(run_id), _market(**MARKET))
+    assert outcome["reference_price_recorded"] == 104.0 and outcome["entry_close"] == 100.0
+    assert outcome["raw_return"] == pytest.approx(0.10)
+
+
+def test_a_blocked_proposal_is_measured_hypothetically(tmp_path):
+    pilot = Pilot(_config(tmp_path))
+    run_id = _record(pilot, _decision(stop_loss=None), reference=PAST)
+    assert pilot.status(run_id) == BLOCKED
+    outcome = M.hypothetical_outcome(pilot.proposal(run_id), _market(**MARKET))
+    assert outcome["state"] == "ok" and outcome["hypothetical"] is True
+    assert outcome["directional_alpha"] == pytest.approx(0.08)
+    # Without a stop there is no risk to measure reward against.
+    assert outcome["risk_pct"] is None and outcome["r_multiple"] is None
+    assert outcome["stop_breached_on_close"] is None
+
+
+def test_risk_reward_is_measured_where_entry_and_stop_define_a_risk(tmp_path):
+    pilot = Pilot(_config(tmp_path))
+    win = M.hypothetical_outcome(pilot.proposal(_record(pilot, reference=PAST)), _market(**MARKET))
+    assert win["risk_pct"] == pytest.approx(0.05) and win["r_multiple"] == pytest.approx(2.0)
+    assert win["stop_breached_on_close"] is False
+    slump = M.hypothetical_outcome(
+        pilot.proposal(_record(pilot, ticker="ERIC-B.ST", reference=PAST)), _market(**MARKET))
+    assert slump["raw_return"] == pytest.approx(-0.04)
+    assert slump["stop_breached_on_close"] is True      # closed at 93 below the 95 stop level
+    sell = _decision(final_rating="Sell", pm_direction="SELL", trader_action="SELL",
+                     entry_price=100.0, stop_loss=105.0, price_target=None)
+    short = M.hypothetical_outcome(
+        pilot.proposal(_record(pilot, sell, ticker="ERIC-B.ST", reference=PAST)), _market(**MARKET))
+    assert short["directional_return"] == pytest.approx(0.04)
+    assert short["r_multiple"] == pytest.approx(0.8)
+
+
+def _mixed_pilot(tmp_path) -> Pilot:
+    """Two TRADEABLE, three BLOCKED (one with two reasons), one executed and closed trade."""
+    pilot = _live_pilot(tmp_path)
+    _record(pilot, ticker="ERIC-B.ST", reference=PAST)                       # TRADEABLE, -4 %
+    _record(pilot, _decision(stop_loss=None), reference=PAST)                # BLOCKED: stop
+    _record(pilot, _decision(stop_loss=None, entry_price=None), reference=PAST)  # stop + entry
+    _record(pilot, _decision(trader_action="SELL"), ticker="ERIC-B.ST", reference=PAST)
+    traded = _record(pilot)                                                  # TRADEABLE, today
+    pilot.approve(traded)
+    pilot.record_execution(traded, price=100.0, quantity=20, courtage=1.0, executed_at=_now())
+    pilot.record_close(traded, price=105.0, quantity=20, courtage=1.0, executed_at=_now())
+    return pilot
+
+
+def _report_market():
+    today = pd.Timestamp(TODAY, tz="Europe/Stockholm")
+    recent = [today - pd.Timedelta(days=1), today]
+    full = {**MARKET,
+            "^OMXSBGI": pd.concat([MARKET["^OMXSBGI"], pd.Series([1000.0, 1000.0], index=recent)]),
+            TICKER: pd.concat([MARKET[TICKER], pd.Series([100.0, 100.0], index=recent)])}
+    return _market(**full)
+
+
+def test_tradeable_blocked_and_executed_are_reported_apart(tmp_path):
+    pilot = _mixed_pilot(tmp_path)
+    report = M.build_report(pilot, get_closes=_report_market())["main"]
+
+    tradeable = report["tradeable_hypothetical"]
+    assert tradeable["n"] == 1 and tradeable["pending"] == 1   # today's run has no horizon yet
+    assert tradeable["mean_raw_return"] == pytest.approx(-0.04)
+    blocked = report["blocked_hypothetical"]
+    assert blocked["n"] == 3
+    assert blocked["mean_directional_alpha"] == pytest.approx((0.08 + 0.08 - 0.06) / 3)
+    by_reason = report["blocked_by_reason"]
+    assert by_reason["MISSING_STOP"]["n"] == 2 and by_reason["MISSING_ENTRY"]["n"] == 1
+    assert by_reason["DIRECTION_CONFLICT"]["n"] == 1
+    trades = report["executed_trades"]
+    assert trades["n"] == 1 and trades["total_net_pnl"] == 98.0
+    assert trades["mean_alpha_net"] == pytest.approx(98.0 / 2000.0)
+    # Nothing is recorded by the report.
+    assert L.EVALUATED not in [e["type"] for e in pilot.ledger.events()]
+
+
+def test_small_groups_carry_a_warning(tmp_path):
+    report = M.build_report(_mixed_pilot(tmp_path), get_closes=_report_market())["main"]
+    for group in (report["tradeable_hypothetical"], report["blocked_hypothetical"],
+                  report["executed_trades"], *report["blocked_by_reason"].values()):
+        assert group["warning"] and "< 30" in group["warning"]
+    ok = {"state": "ok", "raw_return": 0.01, "alpha": 0.0, "directional_return": 0.01,
+          "directional_alpha": 0.0, "r_multiple": None, "stop_breached_on_close": None}
+    assert M.summarize([ok] * 29)["warning"] and M.summarize([ok] * 30)["warning"] is None
+    assert "VARNING: n=1 < 30" in M.render_report(
+        M.build_report(_mixed_pilot(tmp_path / "again"), get_closes=_report_market()))
+
+
+def test_historical_runs_are_left_out_by_default_and_shown_apart_on_request(tmp_path):
+    pilot = Pilot(_config(tmp_path))
+    _record(pilot, reference=PAST)
+    _record(pilot, ticker="ERIC-B.ST", reference=PAST, historical=True)
+    _record(pilot, _decision(stop_loss=None), ticker="ERIC-B.ST", reference=PAST, historical=True)
+    market = _market(**MARKET)
+
+    default = M.build_report(pilot, get_closes=market)
+    assert "historical" not in default and default["excluded_historical_runs"] == 2
+    assert default["main"]["tradeable_hypothetical"]["n"] == 1
+    assert default["main"]["tradeable_hypothetical"]["mean_raw_return"] == pytest.approx(0.10)
+    assert default["main"]["blocked_hypothetical"]["n"] == 0
+    assert "--include-historical" in M.render_report(default)
+
+    shown = M.build_report(pilot, get_closes=market, include_historical=True)
+    assert shown["main"] == default["main"]                # the headline figures do not move
+    assert shown["historical"]["label"] == M.HISTORICAL_LABEL
+    assert shown["historical"]["tradeable_hypothetical"]["mean_raw_return"] == pytest.approx(-0.04)
+    assert shown["historical"]["blocked_hypothetical"]["n"] == 1
+    assert M.HISTORICAL_LABEL in M.render_report(shown)
+
+
+def test_the_cli_reports_without_recording(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from mti_pilot.cli import app
+    from tradingagents.dataflows.vendors.yahoo import market as yahoo_market
+
+    config = tmp_path / "pilot.toml"
+    config.write_text(f'MODE = "SHADOW"\nDATA_DIR = "{tmp_path / "data"}"\n', encoding="utf-8")
+    monkeypatch.setenv("MTI_PILOT_CONFIG", str(config))
+    pilot = Pilot(parse_config({"DATA_DIR": str(tmp_path / "data")}))
+    _record(pilot, reference=PAST)
+    _record(pilot, ticker="ERIC-B.ST", reference=PAST, historical=True)
+    monkeypatch.setattr(yahoo_market, "get_closes", _market(**MARKET))
+
+    plain = CliRunner().invoke(app, ["evaluate"])
+    assert plain.exit_code == 0, plain.output
+    assert "a) TRADEABLE – hypotetiskt: n=1" in plain.output and M.HISTORICAL_LABEL not in plain.output
+    shown = CliRunner().invoke(app, ["evaluate", "--include-historical"])
+    assert M.HISTORICAL_LABEL in shown.output
+    assert [e["type"] for e in pilot.ledger.events()].count(L.EVALUATED) == 0
+
+
+# The guard's decisions are pinned ---------------------------------------------------------
+
+def test_the_guard_gives_the_same_outcome_as_before_for_every_pinned_case():
+    from tests import mti_guard_cases
+
+    golden = json.loads(mti_guard_cases.GOLDEN.read_text(encoding="utf-8"))
+    current = mti_guard_cases.compute()
+    assert len(golden) == len(current) == 2240
+    changed = sorted(k for k in golden if golden[k] != current[k])
+    assert changed == [], changed[:5]
+    assert sum(v.startswith("TRADEABLE") for v in golden.values()) == 38
 
 
 # Live data, run only on request ------------------------------------------------------------
 
 @pytest.mark.integration
-def test_yahoo_serves_swedish_prices_and_omxspi_point_in_time():
+def test_yahoo_serves_swedish_prices_and_the_gross_benchmark(tmp_path):
     from tradingagents.dataflows.vendors.yahoo.market import get_closes
     from tradingagents.memory.settlement import fetch_returns
 
-    for symbol in ("VOLV-B.ST", "ERIC-B.ST", "INVE-B.ST", "ATCO-A.ST", "SEB-A.ST", "^OMXSPI"):
-        assert len(get_closes(symbol, "2026-09-01", "2026-09-15")) > 5, symbol
-    raw, alpha, days, resolved = fetch_returns("VOLV-B.ST", "2026-09-01", 5, benchmark="^OMXSPI")
+    year = {s: get_closes(s, "2025-10-06", "2026-10-07")
+            for s in ("VOLV-B.ST", "ERIC-B.ST", "INVE-B.ST", "ATCO-A.ST", "SEB-A.ST", "^OMXSBGI")}
+    bench_days = {d.date() for d in year["^OMXSBGI"].index}
+    assert len(bench_days) > 240
+    for symbol, closes in year.items():
+        assert {d.date() for d in closes.index} == bench_days, symbol
+    raw, alpha, days, resolved = fetch_returns("VOLV-B.ST", "2026-09-01", 5, benchmark="^OMXSBGI")
     assert days == 5 and resolved > "2026-09-01" and alpha is not None
+
+    pilot = Pilot(_config(tmp_path))
+    run_id = _record(pilot, reference=ReferencePrice(345.0, REF_DAY, "yahoo"))
+    outcome = M.hypothetical_outcome(pilot.proposal(run_id), get_closes)
+    assert outcome["state"] == "ok" and outcome["benchmark"] == "^OMXSBGI"
