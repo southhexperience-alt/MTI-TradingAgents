@@ -1,0 +1,21 @@
+MTI-TradingAgents
+Copyright 2026 MTI, for the MTI additions.
+
+This product is a fork of TradingAgents by TauricResearch
+(https://github.com/TauricResearch/TradingAgents), licensed under the
+Apache License, Version 2.0 (see LICENSE). It is based on upstream
+release v0.6.0, commit 1394a3f72aa4393e1a98f51b382434c4b4c2d972.
+
+Upstream files modified in this fork:
+- tradingagents/default_config.py  (added ".ST" -> "^OMXSPI" to benchmark_map)
+- pyproject.toml                   (packages the mti_pilot module and its
+                                    mti-pilot console script)
+
+Added in this fork:
+- mti_pilot/            Swedish guarded pilot layer (risk guard, ledger,
+                        manual-execution workflow, CLI)
+- tests/test_mti_pilot.py
+- MTI_PILOT.md
+- NOTICE
+
+The MTI additions are made available under the same Apache License 2.0.

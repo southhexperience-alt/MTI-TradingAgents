@@ -42,12 +42,13 @@ bedrock = [
 
 [project.scripts]
 tradingagents = "cli.main:app"
+mti-pilot = "mti_pilot.cli:app"
 
 [tool.setuptools.dynamic]
 version = {attr = "tradingagents.__version__"}
 
 [tool.setuptools.packages.find]
-include = ["tradingagents*", "cli*"]
+include = ["tradingagents*", "cli*", "mti_pilot*"]
 
 [tool.setuptools.package-data]
 cli = ["static/*"]
